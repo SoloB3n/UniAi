@@ -116,9 +116,15 @@ class Tensor:
         for node in reversed(order):
             if node._backward is not None and node.grad is not None:
                 node._backward()
-                # Interior gradients are no longer needed; free memory early.
-                if node is not self and node._parents:
+            if node._parents:
+                # The graph is consumed: drop interior gradients and break the
+                # node -> closure -> node cycle so activations are freed by
+                # reference counting right away instead of piling up until
+                # the cyclic garbage collector happens to run.
+                if node is not self:
                     node.grad = None
+                node._backward = None
+                node._parents = ()
 
     # ---------------------------------------------------------- arithmetic
     def __add__(self, other):

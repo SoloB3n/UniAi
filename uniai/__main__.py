@@ -134,6 +134,7 @@ def _load_any(a):
         if not a.tokenizer:
             sys.exit("a .bin model from the C engine needs --tokenizer PREFIX_tokenizer.json")
         model, meta = cformat.load_bin(a.ckpt)
+        meta["data"] = a.tokenizer.removesuffix("_tokenizer.json") + " (C engine)"
         return model, Tokenizer.load(a.tokenizer), meta
     return checkpoint.load(a.ckpt)
 
