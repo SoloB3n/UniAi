@@ -253,12 +253,37 @@ static void matmul_backward(float *dinp, float *dW, float *db, const float *dout
         }
 }
 
+/* --------------------------------------------------------------- dropout
+ * Masks are never stored: keep/drop for element i of site s is a pure hash
+ * of (seed, s, i), so the backward pass regenerates exactly the same mask.
+ * drop_p == 0 disables dropout (evaluation, sampling, parity tests). */
+static float drop_p = 0.0f;
+static uint64_t drop_seed = 0;
+
+static inline float drop_scale(uint32_t site, size_t i) {
+    uint64_t x = drop_seed ^ ((uint64_t)site << 44) ^ (i * 0x9E3779B97F4A7C15ULL);
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return (float)(x >> 40) * (1.0f / 16777216.0f) >= drop_p ? 1.0f / (1.0f - drop_p) : 0.0f;
+}
+
+/* x *= mask, in place (forward on an output, or backward on its gradient) */
+static void dropout_apply(float *x, size_t N, uint32_t site) {
+    if (drop_p <= 0.0f) return;
+    #pragma omp parallel for
+    for (size_t i = 0; i < N; i++) x[i] *= drop_scale(site, i);
+}
+
+enum { SITE_EMB = 0, SITE_ATT = 1, SITE_APROJ = 2, SITE_FPROJ = 3 };
+#define SITE(l, kind) ((uint32_t)(1 + (l)) * 4 + (kind))
+
 /* qkv (B,T,3C) -> out (B,T,C); att (B,H,T,T) keeps the softmax for backward.
  * Work is split per (batch, head).  K is transposed to (D,T) first so every
  * inner loop runs over contiguous memory as an axpy, which vectorizes
  * without reassociating floating-point sums. */
 static void attention_forward(float *out, float *att, const float *qkv,
-                              int B, int T, int C, int H) {
+                              int B, int T, int C, int H, uint32_t site) {
     int D = C / H, C3 = 3 * C;
     float scale = 1.0f / sqrtf((float)D);
     #pragma omp parallel for collapse(2)
@@ -287,6 +312,7 @@ static void attention_forward(float *out, float *att, const float *qkv,
                 for (int t2 = 0; t2 <= t; t2++) {
                     const float *v = qkv + ((size_t)b * T + t2) * C3 + 2 * C + h * D;
                     float w = a[t2];
+                    if (drop_p > 0.0f) w *= drop_scale(site, ((((size_t)b * H + h) * T + t) * T) + t2);
                     for (int i = 0; i < D; i++) o[i] += w * v[i];
                 }
             }
@@ -295,7 +321,7 @@ static void attention_forward(float *out, float *att, const float *qkv,
 }
 
 static void attention_backward(float *dqkv, const float *dout, const float *qkv,
-                               const float *att, int B, int T, int C, int H) {
+                               const float *att, int B, int T, int C, int H, uint32_t site) {
     int D = C / H, C3 = 3 * C;
     float scale = 1.0f / sqrtf((float)D);
     /* each (b,h) touches only its own head's slice of dqkv: no races */
@@ -319,13 +345,17 @@ static void attention_backward(float *dqkv, const float *dout, const float *qkv,
                     const float *v = vt + (size_t)i * T;
                     for (int t2 = 0; t2 <= t; t2++) datt[t2] += di * v[t2];
                 }
+                size_t row = (((size_t)b * H + h) * T + t) * T;
+                if (drop_p > 0.0f)
+                    for (int t2 = 0; t2 <= t; t2++) datt[t2] *= drop_scale(site, row + t2);
                 float dot = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) dot += datt[t2] * a[t2];
                 for (int t2 = 0; t2 <= t; t2++) {
                     float *dv = dqkv + ((size_t)b * T + t2) * C3 + 2 * C + h * D;
                     float w = a[t2];
-                    for (int i = 0; i < D; i++) dv[i] += w * d[i];
-                    /* softmax backward, then into q and k */
+                    float wd = drop_p > 0.0f ? w * drop_scale(site, row + t2) : w;
+                    for (int i = 0; i < D; i++) dv[i] += wd * d[i];
+                    /* softmax backward (on the undropped probabilities) */
                     float dpre = w * (datt[t2] - dot) * scale;
                     const float *k = qkv + ((size_t)b * T + t2) * C3 + C + h * D;
                     float *dk = dqkv + ((size_t)b * T + t2) * C3 + C + h * D;
@@ -515,6 +545,7 @@ static float gpt_forward(GPT *m, int B, int T, int with_targets) {
     size_t N = (size_t)B * T, NC = N * C, att_sz = (size_t)B * H * T * T;
     float **p = m->p, **a = m->a;
     encoder_forward(a[ENC], m->inputs, p[WTE], p[WPE], B, T, C);
+    dropout_apply(a[ENC], NC, SITE_EMB);
     for (int l = 0; l < c.L; l++) {
         float *res = l == 0 ? a[ENC] : a[RES3] + (l - 1) * NC;
         float *ln1 = a[LN1] + l * NC, *qkv = a[QKV] + l * 3 * NC, *atty = a[ATTY] + l * NC;
@@ -524,14 +555,16 @@ static float gpt_forward(GPT *m, int B, int T, int with_targets) {
         layernorm_forward(ln1, a[LN1M] + l * N, a[LN1R] + l * N, res,
                           p[LN1W] + l * C, p[LN1B] + l * C, N, C);
         matmul_forward(qkv, ln1, p[QKVW] + (size_t)l * C * 3 * C, p[QKVB] + l * 3 * C, N, C, 3 * C);
-        attention_forward(atty, att, qkv, B, T, C, H);
+        attention_forward(atty, att, qkv, B, T, C, H, SITE(l, SITE_ATT));
         matmul_forward(aproj, atty, p[APW] + (size_t)l * C * C, p[APB] + l * C, N, C, C);
+        dropout_apply(aproj, NC, SITE(l, SITE_APROJ));
         residual_forward(res2, res, aproj, NC);
         layernorm_forward(ln2, a[LN2M] + l * N, a[LN2R] + l * N, res2,
                           p[LN2W] + l * C, p[LN2B] + l * C, N, C);
         matmul_forward(fch, ln2, p[FCW] + (size_t)l * C * 4 * C, p[FCB] + l * 4 * C, N, C, 4 * C);
         gelu_forward(fchg, fch, 4 * NC);
         matmul_forward(fproj, fchg, p[FPW] + (size_t)l * 4 * C * C, p[FPB] + l * C, N, 4 * C, C);
+        dropout_apply(fproj, NC, SITE(l, SITE_FPROJ));
         residual_forward(res3, res2, fproj, NC);
     }
     float *last = a[RES3] + (c.L - 1) * NC;
@@ -563,6 +596,7 @@ static void gpt_backward(GPT *m, int B, int T) {
         /* res3 = res2 + fproj */
         accumulate(dres2, dres3, NC);
         accumulate(dfproj, dres3, NC);
+        dropout_apply(dfproj, NC, SITE(l, SITE_FPROJ));
         matmul_backward(dfchg, g[FPW] + (size_t)l * 4 * C * C, g[FPB] + l * C, dfproj, fchg,
                         p[FPW] + (size_t)l * 4 * C * C, N, 4 * C, C);
         gelu_backward(dfch, fch, dfchg, 4 * NC);
@@ -573,14 +607,16 @@ static void gpt_backward(GPT *m, int B, int T) {
         /* res2 = res + aproj */
         accumulate(dres, dres2, NC);
         accumulate(daproj, dres2, NC);
+        dropout_apply(daproj, NC, SITE(l, SITE_APROJ));
         matmul_backward(datty, g[APW] + (size_t)l * C * C, g[APB] + l * C, daproj, atty,
                         p[APW] + (size_t)l * C * C, N, C, C);
-        attention_backward(dqkv, datty, qkv, att, B, T, C, H);
+        attention_backward(dqkv, datty, qkv, att, B, T, C, H, SITE(l, SITE_ATT));
         matmul_backward(dln1, g[QKVW] + (size_t)l * C * 3 * C, g[QKVB] + l * 3 * C, dqkv, ln1,
                         p[QKVW] + (size_t)l * C * 3 * C, N, C, 3 * C);
         layernorm_backward(dres, g[LN1W] + l * C, g[LN1B] + l * C, dln1, res,
                            p[LN1W] + l * C, a[LN1M] + l * N, a[LN1R] + l * N, N, C);
     }
+    dropout_apply(da[ENC], NC, SITE_EMB);
     encoder_backward(g[WTE], g[WPE], da[ENC], m->inputs, B, T, C);
 }
 
@@ -738,10 +774,11 @@ static void usage(void) {
         "UniAi C engine\n"
         "  uniai train  -i PREFIX -o OUT.bin [-r RESUME.bin] [-L layers] [-H heads]\n"
         "               [-C embd] [-T block] [-B batch] [-n steps] [-l lr] [-w warmup]\n"
-        "               [-d weight_decay] [-e eval_every] [-s seed]\n"
+        "               [-d weight_decay] [-p dropout] [-e eval_every] [-s seed]\n"
         "               reads PREFIX_train.bin, PREFIX_val.bin, PREFIX_vocab.bin\n"
         "  uniai sample -m MODEL.bin -v VOCAB.bin [-n tokens] [-t temperature] [-s seed]\n"
-        "  uniai check  MODEL.bin BATCH.bin OUT.bin\n");
+        "  uniai check  MODEL.bin BATCH.bin OUT.bin\n"
+        "  uniai gradcheck MODEL.bin BATCH.bin DROPOUT\n");
     exit(1);
 }
 
@@ -758,7 +795,7 @@ static int cmd_train(int argc, char **argv) {
     const char *prefix = NULL, *out = "model.bin", *resume = NULL;
     Config c = {0, 128, 4, 4, 128};
     int B = 16, steps = 3000, warmup = 100, eval_every = 500, eval_iters = 20;
-    float lr = 1e-3f, wd = 0.1f;
+    float lr = 1e-3f, wd = 0.1f, dropout = 0.1f;
     for (int i = 2; i + 1 < argc; i += 2) {
         char f = argv[i][1];
         const char *v = argv[i + 1];
@@ -768,6 +805,7 @@ static int cmd_train(int argc, char **argv) {
         else if (f == 'B') B = atoi(v); else if (f == 'n') steps = atoi(v);
         else if (f == 'l') lr = atof(v); else if (f == 'w') warmup = atoi(v);
         else if (f == 'd') wd = atof(v); else if (f == 'e') eval_every = atoi(v);
+        else if (f == 'p') dropout = atof(v);
         else if (f == 's') rng_state = strtoull(v, NULL, 10) * 2654435761ULL + 1;
         else usage();
     }
@@ -806,9 +844,12 @@ static int cmd_train(int argc, char **argv) {
     for (int step = m.step; step < steps; step++) {
         float cur_lr = cosine_lr(step, lr, warmup, steps);
         get_batch(&m, train, B, T);
+        drop_p = dropout;
+        drop_seed = ((uint64_t)rand_u32() << 32) | rand_u32();
         float loss = gpt_forward(&m, B, T, 1);
         memset(m.grads, 0, m.nparams * sizeof(float));
         gpt_backward(&m, B, T);
+        drop_p = 0.0f; /* evaluation and sampling run without dropout */
         float norm = clip_grad_norm(&m, 1.0f);
         adamw_step(&m, cur_lr, wd, step + 1);
         m.step = step + 1;
@@ -888,11 +929,51 @@ static int cmd_check(int argc, char **argv) {
     return 0;
 }
 
+/* finite-difference check of the analytic gradients with dropout active:
+ * same seed => same masks, so the loss is a deterministic function */
+static int cmd_gradcheck(int argc, char **argv) {
+    if (argc != 5) usage();
+    GPT m = {0};
+    gpt_load(&m, argv[2]);
+    FILE *f = xfopen(argv[3], "rb");
+    int hdr[2];
+    xfread(hdr, sizeof(int), 2, f);
+    int B = hdr[0], T = hdr[1];
+    gpt_alloc_acts(&m, B, T);
+    xfread(m.inputs, sizeof(int), (size_t)B * T, f);
+    xfread(m.targets, sizeof(int), (size_t)B * T, f);
+    fclose(f);
+    drop_p = atof(argv[4]);
+    drop_seed = 12345;
+    gpt_forward(&m, B, T, 1);
+    gpt_backward(&m, B, T);
+    double worst = 0.0;
+    for (int i = 0; i < NPARAMS; i++) {
+        size_t best = 0;  /* probe the entry with the largest gradient */
+        for (size_t j = 0; j < m.psize[i]; j++)
+            if (fabsf(m.g[i][j]) > fabsf(m.g[i][best])) best = j;
+        float *p = &m.p[i][best], old = *p, eps = 1e-2f;
+        double lp = 0, lm = 0;
+        *p = old + eps; gpt_forward(&m, B, T, 1);
+        for (int n = 0; n < B * T; n++) lp += m.a[LOSSES][n];
+        *p = old - eps; gpt_forward(&m, B, T, 1);
+        for (int n = 0; n < B * T; n++) lm += m.a[LOSSES][n];
+        *p = old;
+        double num = (lp - lm) / (B * T) / (2 * eps), ana = m.g[i][best];
+        double err = fabs(num - ana) / (fabs(num) + fabs(ana) + 1e-8);
+        if (err > worst) worst = err;
+        printf("param %2d  analytic % .6e  numeric % .6e  rel err %.1e\n", i, ana, num, err);
+    }
+    printf("worst rel err %.1e\n", worst);
+    return worst < 2e-2 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) usage();
     if (!strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (!strcmp(argv[1], "sample")) return cmd_sample(argc, argv);
     if (!strcmp(argv[1], "check")) return cmd_check(argc, argv);
+    if (!strcmp(argv[1], "gradcheck")) return cmd_gradcheck(argc, argv);
     usage();
     return 1;
 }

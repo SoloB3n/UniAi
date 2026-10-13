@@ -63,6 +63,28 @@ def run_case(cfg, B, T, seed):
     return loss.item(), rel(c_grads, py_grads)
 
 
+def test_dropout_gradcheck():
+    """With dropout on, C gradients must match finite differences (mask replay)."""
+    np.random.seed(3)
+    rng = np.random.default_rng(3)
+    model = GPT(vocab_size=50, block_size=16, n_layer=2, n_head=2, n_embd=16, dropout=0.0)
+    for _, p in model.named_parameters():
+        p.data += 0.1 * np.random.randn(*p.shape).astype(np.float32)
+    B, T = 2, 12
+    x = rng.integers(0, 50, size=(B, T))
+    y = rng.integers(0, 50, size=(B, T))
+    with tempfile.TemporaryDirectory() as d:
+        mpath, bpath = os.path.join(d, "m.bin"), os.path.join(d, "b.bin")
+        cformat.save_bin(mpath, model)
+        with open(bpath, "wb") as f:
+            f.write(np.array([B, T], dtype=np.int32).tobytes())
+            f.write(x.astype(np.int32).tobytes() + y.astype(np.int32).tobytes())
+        r = subprocess.run([BIN, "gradcheck", mpath, bpath, "0.3"],
+                           capture_output=True, text=True)
+    print("  " + r.stdout.strip().splitlines()[-1])
+    assert r.returncode == 0, r.stdout
+
+
 class _GradView:
     """Lets cformat.flatten read gradients instead of weights."""
 
