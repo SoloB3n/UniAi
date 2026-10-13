@@ -795,7 +795,7 @@ static int cmd_train(int argc, char **argv) {
     const char *prefix = NULL, *out = "model.bin", *resume = NULL;
     Config c = {0, 128, 4, 4, 128};
     int B = 16, steps = 3000, warmup = 100, eval_every = 500, eval_iters = 20;
-    float lr = 1e-3f, wd = 0.1f, dropout = 0.1f;
+    float lr = 1e-3f, wd = 0.1f, dropout = 0.0f;
     for (int i = 2; i + 1 < argc; i += 2) {
         char f = argv[i][1];
         const char *v = argv[i + 1];

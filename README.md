@@ -71,7 +71,49 @@ make test                                               # gradcheck + parità C/
 
 Python prepara i dati (tokenizer BPE) e offre la chat; il C fa il lavoro
 pesante. Opzioni di `uniai_c train`: `-L` strati, `-H` teste, `-C` dimensione,
-`-T` contesto, `-B` batch, `-n` passi, `-l` learning rate, `-r` per riprendere.
+`-T` contesto, `-B` batch, `-n` passi, `-l` learning rate, `-p` dropout,
+`-r` per riprendere.
+
+#### Risultati misurati
+
+Stessa macchina (4 core Xeon, AVX-512), stesso modello (0,94M parametri, 4
+strati, contesto 128, vocabolario BPE 1024), batch 16, corpus Tiny
+Shakespeare (1,1 MB):
+
+| | Python + NumPy | C |
+|---|---|---|
+| Tempo per passo | ~900 ms | **~160 ms (≈5,6× più veloce)** |
+| 3000 passi | ~45 min | **8 min 44 s** |
+| GEMM (kernel singolo) | — | 220–240 GFLOP/s |
+
+| Addestramento C, 3000 passi | val loss | perplessità |
+|---|---|---|
+| senza dropout | **3,50** | 33 |
+| dropout 0,1 (`-p 0.1`) | 3,62 | 37 |
+
+Su un addestramento così breve il dropout rallenta l'apprendimento più di
+quanto riduca l'overfitting, quindi in C il default è 0; diventa utile con
+più passi o modelli più grandi rispetto ai dati.
+
+Esempio generato dal modello C (prompt `ROMEO:`):
+
+```
+ROMEO:
+Why, my lord?
+
+ROMEO:
+I do not fight against his daughter,
+...
+HENRY BOLINGBROKE:
+I will, madam: I hope, if thou art crember,
+```
+
+Ha imparato la forma di un'opera teatrale (personaggi, versi, dialoghi) e
+molto vocabolario; il senso delle frasi richiede modelli e dati più grandi.
+
+Il dropout nel motore C non salva maschere: ogni decisione tieni/scarta è un
+hash di (seme del passo, punto della rete, indice), e il backward la rigenera
+identica. `uniai_c gradcheck` lo verifica con le differenze finite.
 
 Come è fatto il GEMM: un blocco di 6 righe × 32 colonne (16 senza AVX-512) del
 risultato resta nei registri per tutto il ciclo su K, così ogni dato caricato
