@@ -1,4 +1,4 @@
-# UniAi
+# UniAi - Towards AGI
 
 **Un modello linguistico costruito da zero.** Niente PyTorch, niente TensorFlow,
 niente BLAS, niente modelli pre-addestrati. Ogni pezzo — il calcolo dei
