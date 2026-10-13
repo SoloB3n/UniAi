@@ -3,3 +3,6 @@ __pycache__/
 *.npz
 data/*.txt
 runs/
+data/*.bin
+data/*.json
+uniai_c

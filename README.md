@@ -1,9 +1,21 @@
 # UniAi
 
 **Un modello linguistico costruito da zero.** Niente PyTorch, niente TensorFlow,
-niente modelli pre-addestrati: solo Python e NumPy. Ogni pezzo — il calcolo dei
-gradienti, la rete neurale, il tokenizer, l'ottimizzatore — è scritto qui, in
-circa 800 righe che si possono leggere dall'inizio alla fine.
+niente BLAS, niente modelli pre-addestrati. Ogni pezzo — il calcolo dei
+gradienti, la rete neurale, il tokenizer, l'ottimizzatore, perfino la
+moltiplicazione di matrici — è scritto qui.
+
+Ci sono **due motori** che implementano lo stesso identico modello:
+
+- **Python + NumPy** (`uniai/`): il laboratorio. Autograd generico, leggibile,
+  ogni gradiente verificato numericamente.
+- **C puro** (`csrc/uniai.c`): il motore da corsa. Forward e backward scritti
+  a mano kernel per kernel, un GEMM proprio con tiling a registri, OpenMP su
+  tutti i core, zero dipendenze oltre a `libm`.
+
+I due motori sono verificati l'uno contro l'altro: stessi pesi + stesso batch
+⇒ stessa loss, stesso gradiente per ogni parametro e stesso passo di AdamW
+(errore relativo ~10⁻⁷).
 
 È la stessa architettura dei GPT (un *transformer decoder*), in miniatura.
 Gli dai un testo, lui impara a scrivere nello stesso stile.
@@ -25,6 +37,9 @@ testo ──► tokenizer BPE ──► GPT (attention + MLP) ──► probabil
 | `uniai/checkpoint.py` | Modello + tokenizer in un unico file `.npz`. |
 | `uniai/__main__.py` | La riga di comando: `train`, `sample`, `chat`. |
 | `tests/test_autograd.py` | Ogni gradiente è verificato contro le differenze finite — anche quello dell'intero transformer. |
+| `csrc/uniai.c` | **Il motore in C.** Encoder, LayerNorm, attention causale, GELU, testa con pesi condivisi, AdamW: forward e backward scritti a mano. Memoria allocata una sola volta. |
+| `uniai/cformat.py` | Formati binari condivisi tra Python e C (modello, token, vocabolario). |
+| `tests/test_c_engine.py` | Test di parità C ↔ Python: loss, gradienti e passo dell'ottimizzatore. |
 
 ## Provalo
 
@@ -43,6 +58,26 @@ python -m uniai sample --ckpt uniai.npz --prompt "ROMEO:" --tokens 400
 python -m uniai train  --resume uniai.npz --data data/shakespeare.txt --steps 6000
 python tests/test_autograd.py
 ```
+
+### Il motore in C
+
+```sh
+make                                                    # compila ./uniai_c
+python -m uniai prepare --data data/shakespeare.txt --out data/shakespeare
+./uniai_c train -i data/shakespeare -o model.bin        # addestra in C
+python -m uniai chat --ckpt model.bin --tokenizer data/shakespeare_tokenizer.json
+make test                                               # gradcheck + parità C/Python
+```
+
+Python prepara i dati (tokenizer BPE) e offre la chat; il C fa il lavoro
+pesante. Opzioni di `uniai_c train`: `-L` strati, `-H` teste, `-C` dimensione,
+`-T` contesto, `-B` batch, `-n` passi, `-l` learning rate, `-r` per riprendere.
+
+Come è fatto il GEMM: un blocco di 6 righe × 32 colonne (16 senza AVX-512) del
+risultato resta nei registri per tutto il ciclo su K, così ogni dato caricato
+viene riusato 6 volte; con `-march=native` il compilatore lo traduce in
+istruzioni FMA vettoriali. Una variante legge A trasposta direttamente, così
+il gradiente dei pesi `dW = Xᵀ·dY` non richiede trasposizioni esplicite.
 
 ### Addestralo su ciò che vuoi
 
@@ -69,7 +104,8 @@ regolarità statistiche del testo che gli dai. Proprio per questo è prezioso �
 
 ## Prossimi passi possibili
 
-- Backend GPU (CuPy è un sostituto quasi diretto di NumPy)
+- Kernel CUDA per il motore in C (la struttura kernel-per-kernel è già quella giusta)
+- Flash attention (attention a blocchi senza materializzare la matrice T×T)
 - KV-cache per una generazione più veloce
 - Fine-tuning su coppie domanda/risposta per un vero comportamento da chat
 - Mixed precision e gradient accumulation per modelli più grandi

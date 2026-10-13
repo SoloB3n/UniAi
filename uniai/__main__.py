@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 
-from . import checkpoint
+from . import cformat, checkpoint
 from .nn import GPT
 from .optim import AdamW, clip_grad_norm, cosine_lr
 from .tensor import no_grad
@@ -110,6 +110,34 @@ def cmd_train(a):
     print(f"best val loss {best:.4f}")
 
 
+def cmd_prepare(a):
+    """Tokenize a corpus for the C engine: PREFIX_{train,val,vocab}.bin + tokenizer."""
+    with open(a.data, encoding="utf-8") as f:
+        text = f.read()
+    t0 = time.time()
+    tok = Tokenizer.train(text, a.vocab, verbose=True)
+    ids = np.array(tok.encode(text), dtype=np.uint16)
+    split = int(0.9 * len(ids))
+    cformat.save_tokens(a.out + "_train.bin", ids[:split])
+    cformat.save_tokens(a.out + "_val.bin", ids[split:])
+    cformat.save_vocab(a.out + "_vocab.bin", tok)
+    tok.save(a.out + "_tokenizer.json")
+    print(f"{len(text):,} characters -> {len(ids):,} tokens ({tok.vocab_size} vocab) "
+          f"in {time.time() - t0:.1f}s")
+    print(f"wrote {a.out}_{{train,val,vocab}}.bin and {a.out}_tokenizer.json")
+    print(f"next: ./uniai_c train -i {a.out} -o model.bin")
+
+
+def _load_any(a):
+    """Load a .npz (Python) or .bin (C engine) checkpoint."""
+    if a.ckpt.endswith(".bin"):
+        if not a.tokenizer:
+            sys.exit("a .bin model from the C engine needs --tokenizer PREFIX_tokenizer.json")
+        model, meta = cformat.load_bin(a.ckpt)
+        return model, Tokenizer.load(a.tokenizer), meta
+    return checkpoint.load(a.ckpt)
+
+
 def _stream_printer(tok):
     """Print tokens as they arrive, holding back incomplete UTF-8 sequences."""
     buf = bytearray()
@@ -128,7 +156,7 @@ def _stream_printer(tok):
 
 
 def cmd_sample(a):
-    model, tok, meta = checkpoint.load(a.ckpt)
+    model, tok, meta = _load_any(a)
     rng = np.random.default_rng(a.seed)
     prompt = a.prompt.encode().decode("unicode_escape") if a.escape else a.prompt
     sys.stdout.write(prompt)
@@ -139,7 +167,7 @@ def cmd_sample(a):
 
 
 def cmd_chat(a):
-    model, tok, meta = checkpoint.load(a.ckpt)
+    model, tok, meta = _load_any(a)
     rng = np.random.default_rng(a.seed)
     print(f"UniAi — {model.num_parameters():,} parameters, trained on "
           f"{meta.get('data', '?')} (val loss {meta.get('val_loss', float('nan')):.3f})")
@@ -181,9 +209,16 @@ def main(argv=None):
     t.add_argument("--seed", type=int, default=1337)
     t.set_defaults(fn=cmd_train)
 
+    pr = sub.add_parser("prepare", help="tokenize a text file for the C engine")
+    pr.add_argument("--data", required=True)
+    pr.add_argument("--out", required=True, help="output prefix, e.g. data/shakespeare")
+    pr.add_argument("--vocab", type=int, default=1024)
+    pr.set_defaults(fn=cmd_prepare)
+
     for name, fn in (("sample", cmd_sample), ("chat", cmd_chat)):
         s = sub.add_parser(name, help=f"{name} from a trained checkpoint")
-        s.add_argument("--ckpt", default="uniai.npz")
+        s.add_argument("--ckpt", default="uniai.npz", help=".npz (Python) or .bin (C)")
+        s.add_argument("--tokenizer", default=None, help="PREFIX_tokenizer.json for .bin models")
         s.add_argument("--tokens", type=int, default=300)
         s.add_argument("--temperature", type=float, default=0.8)
         s.add_argument("--top-k", type=int, default=50)
