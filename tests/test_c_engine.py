@@ -1,10 +1,13 @@
-"""Parity test: the C engine must match the (gradient-checked) Python engine.
+"""Parity tests: every compiled engine must match the gradient-checked Python one.
 
 Same weights + same batch -> same loss, same gradient for every parameter,
-and the same parameters after one clipped AdamW step.
+and the same parameters after one clipped AdamW step.  Runs against each
+engine that is built: uniai_c (CPU), uniai_gpu_emu (GPU kernels emulated on
+the CPU) and uniai_gpu (real CUDA, only when an NVIDIA GPU is present).
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +21,10 @@ from uniai import cformat  # noqa: E402
 from uniai.nn import GPT  # noqa: E402
 from uniai.optim import AdamW, clip_grad_norm  # noqa: E402
 
-BIN = os.path.join(ROOT, "uniai_c")
+ENGINES = [os.path.join(ROOT, b) for b in ("uniai_c", "uniai_gpu_emu", "uniai_gpu")
+           if os.path.exists(os.path.join(ROOT, b))
+           and (b != "uniai_gpu" or shutil.which("nvidia-smi"))]
+BIN = ENGINES[0] if ENGINES else None
 
 
 def run_case(cfg, B, T, seed):
@@ -107,9 +113,12 @@ def test_parity_default_shape():
 
 
 if __name__ == "__main__":
-    if not os.path.exists(BIN):
-        sys.exit("build the engine first: make")
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
+    if not ENGINES:
+        sys.exit("build an engine first: make")
+    tests = [(n, f) for n, f in list(globals().items()) if n.startswith("test_")]
+    for engine in ENGINES:
+        BIN = engine
+        print(f"[{os.path.basename(engine)}]")
+        for name, fn in tests:
             fn()
             print(f"ok  {name}")

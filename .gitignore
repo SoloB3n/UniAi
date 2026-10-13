@@ -6,3 +6,5 @@ runs/
 data/*.bin
 data/*.json
 uniai_c
+uniai_gpu
+uniai_gpu_emu

@@ -39,7 +39,10 @@ testo ──► tokenizer BPE ──► GPT (attention + MLP) ──► probabil
 | `tests/test_autograd.py` | Ogni gradiente è verificato contro le differenze finite — anche quello dell'intero transformer. |
 | `csrc/uniai.c` | **Il motore in C.** Encoder, LayerNorm, attention causale, GELU, testa con pesi condivisi, AdamW: forward e backward scritti a mano. Memoria allocata una sola volta. |
 | `uniai/cformat.py` | Formati binari condivisi tra Python e C (modello, token, vocabolario). |
-| `tests/test_c_engine.py` | Test di parità C ↔ Python: loss, gradienti e passo dell'ottimizzatore. |
+| `csrc/uniai_gpu.cu` | **Il motore GPU.** Gli stessi strati come kernel CUDA scritti a mano. |
+| `csrc/driver.h` | Modello, addestramento, checkpoint e comandi: condivisi da CPU e GPU. |
+| `csrc/cuda_emu.h` | Emulatore CUDA per testare i kernel GPU su qualsiasi computer. |
+| `tests/test_c_engine.py` | Test di parità di ogni motore (CPU, GPU emulata, GPU reale) contro Python: loss, gradienti e passo dell'ottimizzatore. |
 
 ## Provalo
 
@@ -121,6 +124,41 @@ viene riusato 6 volte; con `-march=native` il compilatore lo traduce in
 istruzioni FMA vettoriali. Una variante legge A trasposta direttamente, così
 il gradiente dei pesi `dW = Xᵀ·dY` non richiede trasposizioni esplicite.
 
+### Il motore GPU (CUDA)
+
+`csrc/uniai_gpu.cu` porta lo stesso modello sulle GPU NVIDIA con kernel CUDA
+scritti a mano: GEMM a tile 64×64 in shared memory (ogni thread accumula un
+blocco 4×4 nei registri), riduzioni a livello di blocco per LayerNorm e
+softmax, e un backward dell'attention diviso in due passate (per righe e per
+colonne) così nessun thread scrive mai dove scrive un altro: niente race,
+risultati deterministici.
+
+Il modello, il ciclo di addestramento e i comandi sono **condivisi** tra CPU e
+GPU (`csrc/driver.h`): cambiano solo i kernel. Stessi comandi, stessi file:
+
+```sh
+make gpu                                   # richiede nvcc e una GPU NVIDIA
+./uniai_gpu train -i data/shakespeare -o model.bin -L 6 -H 6 -C 384 -T 256 -B 32
+```
+
+Su Google Colab (GPU T4 gratuita) basta una riga:
+`bash scripts/gpu_quickstart.sh` — compila, verifica i kernel GPU contro
+Python, poi addestra un modello piccolo e uno 10× più grande.
+
+**Come è stato verificato senza una GPU.** `csrc/cuda_emu.h` è un piccolo
+emulatore CUDA: esegue *gli stessi kernel* sulla CPU, trasformando ogni thread
+GPU in una coroutine; `__syncthreads()` sospende davvero il thread finché
+tutto il blocco non arriva alla barriera, come su una GPU reale. Con
+`make gpu-emu` i kernel GPU superano gli stessi test di parità del motore C
+(errore relativo ~10⁻⁷). L'emulatore è stato a sua volta messo alla prova
+introducendo apposta i bug tipici: una barriera mancante nel GEMM (rilevata:
+loss sbagliata) e una barriera dentro un `if` (rilevata: "divergent
+__syncthreads"). Il codice compila inoltre con `nvcc` 13 per sm_75–sm_90
+(T4, A100, RTX 30/40, H100) senza spill di registri.
+
+Onestà: i kernel non sono ancora stati eseguiti su una GPU fisica, quindi le
+prestazioni reali vanno misurate — è il primo passo dello script Colab.
+
 ### Addestralo su ciò che vuoi
 
 Funziona con **qualunque testo UTF-8**: la Divina Commedia, i tuoi appunti
@@ -146,7 +184,7 @@ regolarità statistiche del testo che gli dai. Proprio per questo è prezioso �
 
 ## Prossimi passi possibili
 
-- Kernel CUDA per il motore in C (la struttura kernel-per-kernel è già quella giusta)
+- Misurare e ottimizzare i kernel GPU su hardware reale (tensor core, float16/bfloat16)
 - Flash attention (attention a blocchi senza materializzare la matrice T×T)
 - KV-cache per una generazione più veloce
 - Fine-tuning su coppie domanda/risposta per un vero comportamento da chat
